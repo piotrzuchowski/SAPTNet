@@ -130,7 +130,16 @@ def infer_coordinate_columns(df: pd.DataFrame) -> Tuple[list, list]:
     Looks for columns named x_<label>, y_<label>, z_<label> and preserves the
     atom order as they appear in the dataframe (x_ columns).
     """
-    x_cols = [col for col in df.columns if col.startswith("x_")]
+    # Coordinate labels look like x_NA1, x_OB2, etc.
+    x_cols = [
+        col
+        for col in df.columns
+        if col.startswith("x_")
+        and len(col) >= 5
+        and col[2].isalpha()
+        and col[3] in ("A", "B")
+        and col[4:].isdigit()
+    ]
     if not x_cols:
         raise ValueError("No coordinate columns found (expected x_<label> style).")
 
@@ -195,6 +204,100 @@ def extract_vector_targets(
         targets[prefix] = df[cols].to_numpy(dtype=float)
     return targets
 
+
+def add_summed_vector_target(
+    df: pd.DataFrame,
+    out_prefix: str,
+    prefix_a: str,
+    prefix_b: str,
+) -> pd.DataFrame:
+    """
+    Add a new vector target by summing two existing vector prefixes.
+    """
+    for axis in ("x", "y", "z"):
+        col_out = f"{out_prefix}_{axis}"
+        col_a = f"{prefix_a}_{axis}"
+        col_b = f"{prefix_b}_{axis}"
+        if col_a not in df.columns or col_b not in df.columns:
+            raise ValueError(f"Missing columns for sum: {col_a}, {col_b}")
+        df[col_out] = df[col_a].to_numpy(dtype=float) + df[col_b].to_numpy(dtype=float)
+    return df
+
+
+def prepare_x1_targets(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Build X1_A and X1_B targets as (x1_pol,r + x1_exch,r) per axis.
+    """
+    add_summed_vector_target(df, "X1_A", "x1_pol,r_A", "x1_exch,r_A")
+    add_summed_vector_target(df, "X1_B", "x1_pol,r_B", "x1_exch,r_B")
+    targets = extract_vector_targets(df, ["X1_A", "X1_B"])
+    return targets["X1_A"], targets["X1_B"]
+
+
+def scale_vector_targets_by_r(
+    df: pd.DataFrame, target_prefixes: Sequence[str], r_column: str = "R", power: float = 3.0
+) -> Dict[str, np.ndarray]:
+    """
+    Scale vector targets by R**power (e.g., power=3 for dipole induction decay).
+    """
+    if r_column not in df.columns:
+        raise ValueError(f"Missing R column: {r_column}")
+    r = df[r_column].to_numpy(dtype=float)
+    if np.any(r <= 0):
+        raise ValueError("R must be positive for scaling.")
+    scale = r ** power
+
+    scaled = {}
+    for prefix in target_prefixes:
+        cols = [f"{prefix}_x", f"{prefix}_y", f"{prefix}_z"]
+        missing = [c for c in cols if c not in df.columns]
+        if missing:
+            raise ValueError(f"Missing target columns for {prefix}: {missing}")
+        vec = df[cols].to_numpy(dtype=float)
+        scaled[prefix] = vec * scale[:, None]
+    return scaled
+
+
+def add_scaled_vector_columns(
+    df: pd.DataFrame,
+    target_prefixes: Sequence[str],
+    out_suffix: str = "scaled",
+    r_column: str = "R",
+    power: float = 3.0,
+) -> pd.DataFrame:
+    """
+    Add scaled vector columns to the dataframe.
+    """
+    scaled = scale_vector_targets_by_r(
+        df, target_prefixes=target_prefixes, r_column=r_column, power=power
+    )
+    for prefix, vec in scaled.items():
+        for axis, idx in (("x", 0), ("y", 1), ("z", 2)):
+            df[f"{prefix}_{out_suffix}_{axis}"] = vec[:, idx]
+    return df
+
+
+class PairwiseVectorDataset:
+    """
+    Minimal dataset: returns pairwise vectors and selected targets.
+    """
+
+    def __init__(
+        self,
+        filepath: Union[str, Path],
+        target_prefixes: Sequence[str],
+        coord_cols: Optional[Sequence[str]] = None,
+    ) -> None:
+        self.df, self.metadata = load_data(filepath)
+        self.coords, self.coord_cols = extract_coordinates(self.df, coord_cols=coord_cols)
+        self.pairwise_vecs, self.pair_indices = compute_pairwise_vectors(self.coords)
+        self.targets = extract_vector_targets(self.df, target_prefixes)
+
+    def __len__(self) -> int:
+        return self.pairwise_vecs.shape[0]
+
+    def __getitem__(self, idx: int) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+        return self.pairwise_vecs[idx], {k: v[idx] for k, v in self.targets.items()}
 
 def prepare_pairwise_vector_dataset(
     filepath: Union[str, Path],
