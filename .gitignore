@@ -1,4 +1,8 @@
 __pycache__/
 *.pyc
+.DS_Store
 data/
 outputs/
+psi4_geom_n2n2/
+n2_n2_dipole_scan.csv
+timer.dat
